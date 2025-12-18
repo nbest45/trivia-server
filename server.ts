@@ -1,6 +1,13 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
+import { createClient } from '@supabase/supabase-js';
+
+// --- SUPABASE BAĞLANTISI ---
+const supabase = createClient(
+  'YOUR_SUPABASE_URL', 
+  'YOUR_SUPABASE_ANON_KEY'
+);
 
 interface Question {
   id: number;
@@ -13,16 +20,11 @@ interface Room {
   id: string;
   name: string;
   players: string[];
+  questions: Question[];
   currentQuestionIndex: number;
   answeredPlayers: string[];
   timer: NodeJS.Timeout | null;
-  isStarted: boolean;
 }
-
-const QUESTIONS: Question[] = [
-  { id: 1, text: "Türkiye'nin başkenti neresidir?", options: ["İstanbul", "Ankara", "İzmir", "Bursa"], answer: 1 },
-  { id: 2, text: "Hangi gezegen Kızıl Gezegen olarak bilinir?", options: ["Mars", "Venüs", "Jüpiter", "Satürn"], answer: 0 },
-];
 
 const QUESTION_DURATION = 10;
 const rooms: Record<string, Room> = {};
@@ -31,25 +33,23 @@ const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
-// Aktif ve boş odaları tüm kullanıcılara yayınlar
 const broadcastRooms = () => {
   const availableRooms = Object.values(rooms)
-    .filter(r => !r.isStarted && r.players.length < 2)
+    .filter(r => r.players.length < 2)
     .map(r => ({ id: r.id, name: r.name, playerCount: r.players.length }));
   io.emit('update_rooms', availableRooms);
 };
 
 const startTimer = (roomID: string) => {
   const room = rooms[roomID];
-  if (!room) return;
-  if (room.timer) clearTimeout(room.timer);
-
+  if (!room || room.timer) return;
+  
   room.timer = setTimeout(() => {
     const winners = room.players.filter(p => room.answeredPlayers.includes(p));
-    winners.forEach(id => io.to(id).emit('game_over', { result: 'win_enemy_timeout' }));
-    
     const losers = room.players.filter(p => !room.answeredPlayers.includes(p));
+
     losers.forEach(id => io.to(id).emit('game_over', { result: 'time_out' }));
+    winners.forEach(id => io.to(id).emit('game_over', { result: 'win_enemy_timeout' }));
 
     delete rooms[roomID];
     broadcastRooms();
@@ -57,90 +57,82 @@ const startTimer = (roomID: string) => {
 };
 
 io.on('connection', (socket: Socket) => {
-  console.log('Bağlandı:', socket.id);
-  broadcastRooms(); // Yeni bağlanana listeyi gönder
+  broadcastRooms();
 
-  // YENİ: Oda Oluşturma
-  socket.on('create_room', (roomName: string) => {
+  // Deste seçerek oda oluşturma
+  socket.on('create_room', async ({ deck_id, deck_name }) => {
+    const { data: cards, error } = await supabase
+      .from('flashcards')
+      .select('front_word, back_word')
+      .eq('deck_id', deck_id)
+      .limit(10);
+
+    if (error || !cards || cards.length === 0) return;
+
+    // Kartları 4 şıklı soru formatına dönüştür
+    const dynamicQuestions: Question[] = cards.map((card, idx) => {
+      const correct = card.back_word;
+      const distractors = cards
+        .filter(c => c.back_word !== correct)
+        .map(c => c.back_word)
+        .sort(() => 0.5 - Math.random())
+        .slice(0, 3);
+      const options = [...distractors, correct].sort(() => 0.5 - Math.random());
+      return { id: idx, text: card.front_word, options, answer: options.indexOf(correct) };
+    });
+
     const roomID = Math.random().toString(36).substring(7);
     rooms[roomID] = {
       id: roomID,
-      name: roomName || `${socket.id.substring(0, 5)}'in Odası`,
+      name: `${deck_name} Challenge`,
       players: [socket.id],
+      questions: dynamicQuestions,
       currentQuestionIndex: 0,
       answeredPlayers: [],
-      timer: null,
-      isStarted: false
+      timer: null
     };
+
     socket.join(roomID);
     socket.emit('room_created', roomID);
     broadcastRooms();
   });
 
-  // YENİ: Odalara Katılma
-  socket.on('join_room', (roomID: string) => {
+  socket.on('join_room', (roomID) => {
     const room = rooms[roomID];
     if (room && room.players.length < 2) {
       room.players.push(socket.id);
       socket.join(roomID);
-      room.isStarted = true;
-      
-      io.to(roomID).emit('game_start', {
-        question: QUESTIONS[0],
-        duration: QUESTION_DURATION
-      });
+      io.to(roomID).emit('game_start', { question: room.questions[0], duration: QUESTION_DURATION });
       startTimer(roomID);
       broadcastRooms();
     }
   });
 
-  socket.on('submit_answer_simple', ({ answerIndex }: { answerIndex: number }) => {
-    // Oyuncunun bağlı olduğu odayı manuel olarak bulalım
-    let roomID = null;
-    for (const id in rooms) {
-      if (rooms[id].players.includes(socket.id)) {
-        roomID = id;
-        break;
-      }
-    }
-  
-    if (!roomID || !rooms[roomID]) return;
-  
+  socket.on('submit_answer_simple', ({ answerIndex }) => {
+    const roomID = Array.from(socket.rooms).find(r => rooms[r]);
+    if (!roomID) return;
     const room = rooms[roomID];
-    const currentQ = QUESTIONS[room.currentQuestionIndex];
-  
-    // Eğer oyuncu zaten cevap verdiyse işlem yapma
-    if (room.answeredPlayers.includes(socket.id)) return;
-    room.answeredPlayers.push(socket.id);
-  
-    // Yanlış cevap kontrolü
-    if (answerIndex !== currentQ.answer) {
+
+    if (!room.answeredPlayers.includes(socket.id)) room.answeredPlayers.push(socket.id);
+
+    if (answerIndex !== room.questions[room.currentQuestionIndex].answer) {
       if (room.timer) clearTimeout(room.timer);
       socket.emit('game_over', { result: 'lose' });
-      const winner = room.players.find(id => id !== socket.id);
-      if (winner) io.to(winner).emit('game_over', { result: 'win' });
-      
+      room.players.filter(id => id !== socket.id).forEach(id => io.to(id).emit('game_over', { result: 'win' }));
       delete rooms[roomID];
       broadcastRooms();
     } else {
-      // Doğru cevap
       if (room.answeredPlayers.length === 1) {
         socket.emit('waiting_opponent');
-      } else if (room.answeredPlayers.length === 2) {
-        // İkisi de doğru bildi -> Sonraki soruya geç
+      } else {
         if (room.timer) clearTimeout(room.timer);
         room.answeredPlayers = [];
         room.currentQuestionIndex++;
-      
-        if (room.currentQuestionIndex >= QUESTIONS.length) {
+        if (room.currentQuestionIndex >= room.questions.length) {
           io.to(roomID).emit('game_over', { result: 'draw' });
           delete rooms[roomID];
-          broadcastRooms();
         } else {
-          io.to(roomID).emit('next_question', {
-            question: QUESTIONS[room.currentQuestionIndex],
-            duration: QUESTION_DURATION
-          });
+          io.to(roomID).emit('next_question', { question: room.questions[room.currentQuestionIndex], duration: QUESTION_DURATION });
           startTimer(roomID);
         }
       }
@@ -151,11 +143,10 @@ io.on('connection', (socket: Socket) => {
     const roomID = Array.from(socket.rooms).find(r => rooms[r]);
     if (roomID) {
       io.to(roomID).emit('game_over', { result: 'opponent_left' });
-      if (rooms[roomID].timer) clearTimeout(rooms[roomID].timer!);
       delete rooms[roomID];
       broadcastRooms();
     }
   });
 });
 
-httpServer.listen(3000, '0.0.0.0', () => console.log('🚀 Lobi Sistemi Aktif: 3000'));
+httpServer.listen(3000, '0.0.0.0', () => console.log('🚀 Sunucu Hazır: 3000'));
