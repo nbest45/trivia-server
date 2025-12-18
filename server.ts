@@ -95,30 +95,52 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('submit_answer_simple', ({ answerIndex }: { answerIndex: number }) => {
-    const roomID = Array.from(socket.rooms).find(r => rooms[r]);
+    // Oyuncunun bağlı olduğu odayı manuel olarak bulalım
+    let roomID = null;
+    for (const id in rooms) {
+      if (rooms[id].players.includes(socket.id)) {
+        roomID = id;
+        break;
+      }
+    }
+  
     if (!roomID || !rooms[roomID]) return;
-
+  
     const room = rooms[roomID];
-    if (!room.answeredPlayers.includes(socket.id)) room.answeredPlayers.push(socket.id);
-
-    if (answerIndex !== QUESTIONS[room.currentQuestionIndex].answer) {
+    const currentQ = QUESTIONS[room.currentQuestionIndex];
+  
+    // Eğer oyuncu zaten cevap verdiyse işlem yapma
+    if (room.answeredPlayers.includes(socket.id)) return;
+    room.answeredPlayers.push(socket.id);
+  
+    // Yanlış cevap kontrolü
+    if (answerIndex !== currentQ.answer) {
       if (room.timer) clearTimeout(room.timer);
       socket.emit('game_over', { result: 'lose' });
-      room.players.filter(id => id !== socket.id).forEach(id => io.to(id).emit('game_over', { result: 'win' }));
+      const winner = room.players.find(id => id !== socket.id);
+      if (winner) io.to(winner).emit('game_over', { result: 'win' });
+      
       delete rooms[roomID];
       broadcastRooms();
     } else {
+      // Doğru cevap
       if (room.answeredPlayers.length === 1) {
         socket.emit('waiting_opponent');
-      } else {
+      } else if (room.answeredPlayers.length === 2) {
+        // İkisi de doğru bildi -> Sonraki soruya geç
         if (room.timer) clearTimeout(room.timer);
         room.answeredPlayers = [];
         room.currentQuestionIndex++;
+      
         if (room.currentQuestionIndex >= QUESTIONS.length) {
           io.to(roomID).emit('game_over', { result: 'draw' });
           delete rooms[roomID];
+          broadcastRooms();
         } else {
-          io.to(roomID).emit('next_question', { question: QUESTIONS[room.currentQuestionIndex], duration: QUESTION_DURATION });
+          io.to(roomID).emit('next_question', {
+            question: QUESTIONS[room.currentQuestionIndex],
+            duration: QUESTION_DURATION
+          });
           startTimer(roomID);
         }
       }
