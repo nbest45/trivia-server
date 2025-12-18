@@ -3,11 +3,10 @@ import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import { createClient } from '@supabase/supabase-js';
 
-// --- SUPABASE BAĞLANTISI ---
-const supabase = createClient(
-  'YOUR_SUPABASE_URL', 
-  'YOUR_SUPABASE_ANON_KEY'
-);
+// --- SUPABASE AYARLARI ---
+const SUPABASE_URL = 'https://pnnaugidvrsawepdhpdp.supabase.co'; // Burayı değiştir!
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBubmF1Z2lkdnJzYXdlcGRocGRwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQzNDc0MTMsImV4cCI6MjA2OTkyMzQxM30.4C2MgOC4yKP8_3aTXoJHB1Ugvv-u7NDOhrFR1R32W-0'; // Burayı değiştir!
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 interface Question {
   id: number;
@@ -42,14 +41,15 @@ const broadcastRooms = () => {
 
 const startTimer = (roomID: string) => {
   const room = rooms[roomID];
-  if (!room || room.timer) return;
-  
+  if (!room) return;
+  if (room.timer) clearTimeout(room.timer);
+
   room.timer = setTimeout(() => {
     const winners = room.players.filter(p => room.answeredPlayers.includes(p));
-    const losers = room.players.filter(p => !room.answeredPlayers.includes(p));
-
-    losers.forEach(id => io.to(id).emit('game_over', { result: 'time_out' }));
     winners.forEach(id => io.to(id).emit('game_over', { result: 'win_enemy_timeout' }));
+    
+    const losers = room.players.filter(p => !room.answeredPlayers.includes(p));
+    losers.forEach(id => io.to(id).emit('game_over', { result: 'time_out' }));
 
     delete rooms[roomID];
     broadcastRooms();
@@ -59,42 +59,58 @@ const startTimer = (roomID: string) => {
 io.on('connection', (socket: Socket) => {
   broadcastRooms();
 
-  // Deste seçerek oda oluşturma
+  // CHALLENGE OLUŞTURMA: Deste seçilince tetiklenir
   socket.on('create_room', async ({ deck_id, deck_name }) => {
-    const { data: cards, error } = await supabase
-      .from('flashcards')
-      .select('front_word, back_word')
-      .eq('deck_id', deck_id)
-      .limit(10);
+    try {
+      // 1. Destedeki kartları çek
+      const { data: cards, error } = await supabase
+        .from('flashcards')
+        .select('front_word, back_word')
+        .eq('deck_id', deck_id);
 
-    if (error || !cards || cards.length === 0) return;
+      if (error || !cards || cards.length < 4) {
+        socket.emit('error', 'Bu destede yeterli kart yok (En az 4 kart lazım).');
+        return;
+      }
 
-    // Kartları 4 şıklı soru formatına dönüştür
-    const dynamicQuestions: Question[] = cards.map((card, idx) => {
-      const correct = card.back_word;
-      const distractors = cards
-        .filter(c => c.back_word !== correct)
-        .map(c => c.back_word)
-        .sort(() => 0.5 - Math.random())
-        .slice(0, 3);
-      const options = [...distractors, correct].sort(() => 0.5 - Math.random());
-      return { id: idx, text: card.front_word, options, answer: options.indexOf(correct) };
-    });
+      // 2. Rastgele 10 kart seç ve test sorusuna dönüştür
+      const shuffledCards = cards.sort(() => 0.5 - Math.random()).slice(0, 10);
+      const dynamicQuestions: Question[] = shuffledCards.map((card, idx) => {
+        const correct = card.back_word;
+        // Yanlış şıklar için tüm desteden rastgele kelimeler al
+        const distractors = cards
+          .filter(c => c.back_word !== correct)
+          .map(c => c.back_word)
+          .sort(() => 0.5 - Math.random())
+          .slice(0, 3);
 
-    const roomID = Math.random().toString(36).substring(7);
-    rooms[roomID] = {
-      id: roomID,
-      name: `${deck_name} Challenge`,
-      players: [socket.id],
-      questions: dynamicQuestions,
-      currentQuestionIndex: 0,
-      answeredPlayers: [],
-      timer: null
-    };
+        const options = [...distractors, correct].sort(() => 0.5 - Math.random());
+        return {
+          id: idx,
+          text: card.front_word,
+          options,
+          answer: options.indexOf(correct)
+        };
+      });
 
-    socket.join(roomID);
-    socket.emit('room_created', roomID);
-    broadcastRooms();
+      // 3. Odayı kur
+      const roomID = Math.random().toString(36).substring(7);
+      rooms[roomID] = {
+        id: roomID,
+        name: `${deck_name} Challenge`,
+        players: [socket.id],
+        questions: dynamicQuestions,
+        currentQuestionIndex: 0,
+        answeredPlayers: [],
+        timer: null
+      };
+
+      socket.join(roomID);
+      socket.emit('room_created', roomID);
+      broadcastRooms();
+    } catch (err) {
+      console.error("Oda oluşturma hatası:", err);
+    }
   });
 
   socket.on('join_room', (roomID) => {
@@ -102,7 +118,10 @@ io.on('connection', (socket: Socket) => {
     if (room && room.players.length < 2) {
       room.players.push(socket.id);
       socket.join(roomID);
-      io.to(roomID).emit('game_start', { question: room.questions[0], duration: QUESTION_DURATION });
+      io.to(roomID).emit('game_start', { 
+        question: room.questions[0], 
+        duration: QUESTION_DURATION 
+      });
       startTimer(roomID);
       broadcastRooms();
     }
@@ -113,12 +132,15 @@ io.on('connection', (socket: Socket) => {
     if (!roomID) return;
     const room = rooms[roomID];
 
-    if (!room.answeredPlayers.includes(socket.id)) room.answeredPlayers.push(socket.id);
+    if (room.answeredPlayers.includes(socket.id)) return;
+    room.answeredPlayers.push(socket.id);
 
-    if (answerIndex !== room.questions[room.currentQuestionIndex].answer) {
+    const isCorrect = answerIndex === room.questions[room.currentQuestionIndex].answer;
+
+    if (!isCorrect) {
       if (room.timer) clearTimeout(room.timer);
       socket.emit('game_over', { result: 'lose' });
-      room.players.filter(id => id !== socket.id).forEach(id => io.to(id).emit('game_over', { result: 'win' }));
+      room.players.find(id => id !== socket.id) && io.to(room.players.find(id => id !== socket.id)!).emit('game_over', { result: 'win' });
       delete rooms[roomID];
       broadcastRooms();
     } else {
@@ -128,11 +150,16 @@ io.on('connection', (socket: Socket) => {
         if (room.timer) clearTimeout(room.timer);
         room.answeredPlayers = [];
         room.currentQuestionIndex++;
+
         if (room.currentQuestionIndex >= room.questions.length) {
           io.to(roomID).emit('game_over', { result: 'draw' });
           delete rooms[roomID];
+          broadcastRooms();
         } else {
-          io.to(roomID).emit('next_question', { question: room.questions[room.currentQuestionIndex], duration: QUESTION_DURATION });
+          io.to(roomID).emit('next_question', { 
+            question: room.questions[room.currentQuestionIndex], 
+            duration: QUESTION_DURATION 
+          });
           startTimer(roomID);
         }
       }
@@ -149,4 +176,4 @@ io.on('connection', (socket: Socket) => {
   });
 });
 
-httpServer.listen(3000, '0.0.0.0', () => console.log('🚀 Sunucu Hazır: 3000'));
+httpServer.listen(3000, '0.0.0.0', () => console.log('🚀 Challenge Sunucusu Yayında: 3000'));
